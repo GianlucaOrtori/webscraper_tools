@@ -1,234 +1,258 @@
 import time
 import csv
-import os
+import re
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, ElementClickInterceptedException, TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
+import requests
+import os
+from urllib.parse import urljoin
 
-# Impostazioni iniziali
-SIKA_URL = "https://ita.sika.com/it/edilizia/prodotti-edilizia.html"
-OUTPUT_CSV_FILE = "sika_prodotti.csv"
-
-# Selettori CSS per gli elementi sulla pagina Sika
-# Questi sono basati sull'HTML che hai fornito
-PRODUCT_CONTAINER_SELECTOR = "div[data-list-item].cell" # Selettore per ogni singolo blocco prodotto
-PRODUCT_LINK_SELECTOR = "a.cmp-teaser_productContainer" # Selettore per il link all'interno del blocco prodotto
-PRODUCT_TITLE_SELECTOR = "h5.cmp-teaser_productContent__title" # Selettore per il titolo del prodotto
-PRODUCT_DESCRIPTION_SELECTOR = "p.cmp-teaser_productContent__text" # Selettore per la descrizione del prodotto
-# Selettore per l'immagine - basato sull'HTML della card che hai mostrato in precedenza
-# Potrebbe essere necessario renderlo più specifico se ci sono altre immagini
-PRODUCT_IMAGE_SELECTOR = "figure.cmp-teaser_productImage img" # Cerca l'img dentro figure.cmp-teaser_productImage
-
-# Selettore corretto per il pulsante "Più Risultati"
-LOAD_MORE_BUTTON_SELECTOR = ".load-more-results button" # Selettore per il pulsante "Più Risultati"
-
-# Configurazione di Selenium WebDriver
-# ASSICURATI DI AVER SCARICATO IL DRIVER DEL BROWSER E CHE SIA NEL TUO PATH DI SISTEMA
-# O SPECIFICA IL PERCORSO COMPLETO AL DRIVER QUI.
-# Esempio per ChromeDriver (assicurati che la versione corrisponda al tuo Chrome):
-# driver_path = "/percorso/al/tuo/chromedriver"
-# driver = webdriver.Chrome(executable_path=driver_path)
-# Per un setup più semplice, se il driver è nel PATH:
-try:
-  # Opzioni per eseguire Chrome in modalità headless (senza aprire la finestra del browser)
-  # Utile per lo scraping su server o per non avere la finestra che si apre
-  # chrome_options = webdriver.ChromeOptions()
-  # chrome_options.add_argument("--headless")
-  # chrome_options.add_argument("--no-sandbox") # Utile in alcuni ambienti Linux
-  # chrome_options.add_argument("--disable-dev-shm-usage") # Utile in alcuni ambienti Linux
-  # driver = webdriver.Chrome(options=chrome_options)
-
-  # Esegui in modalità visibile per debuggare e vedere cosa succede
-  driver = webdriver.Chrome() # O webdriver.Firefox(), webdriver.Edge(), ecc.
-
-except Exception as e:
-  print(f"Errore nell'inizializzazione del WebDriver: {e}")
-  print("Assicurati di aver installato il browser driver corretto (es. ChromeDriver) e che sia nel tuo PATH di sistema.")
-  exit() # Esci se non riesci a inizializzare il driver
-
-
-def scrape_sika_products(url):
-  """
-  Naviga alla pagina Sika, clicca su "Visualizza di più" finché possibile,
-  e poi estrae i dati dei prodotti.
-  """
-  print(f"Navigazione alla pagina: {url}")
-  driver.get(url)
-
-  # Attendi che la pagina iniziale carichi e che i primi prodotti siano visibili
-  try:
-    wait = WebDriverWait(driver, 20) # Attesa iniziale più lunga
-    # Attendi che almeno un contenitore prodotto sia presente
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, PRODUCT_CONTAINER_SELECTOR)))
-    print("Primi prodotti visibili.")
-  except TimeoutException:
-    print("Timeout nell'attesa dei primi prodotti. Procedo con l'HTML disponibile.")
-    # Se i primi prodotti non appaiono, non ha senso continuare
-    return []
-
-
-  # Cicla per cliccare sul pulsante "Visualizza di più"
-  while True:
-    try:
-      print("Ricerca del pulsante 'Visualizza di più'...")
-      # Cerca il pulsante "Visualizza di più" e attendi che sia visibile e cliccabile
-      wait = WebDriverWait(driver, 15) # Aumentata leggermente l'attesa per il pulsante
-      load_more_button = wait.until(
-        EC.visibility_of_element_located((By.CSS_SELECTOR, LOAD_MORE_BUTTON_SELECTOR))
-      )
-      # Attendi anche che sia cliccabile
-      load_more_button = wait.until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, LOAD_MORE_BUTTON_SELECTOR))
-      )
-      print("Pulsante 'Visualizza di più' trovato e cliccabile.")
-
-      # Scrolla il pulsante nella vista (a volte necessario)
-      driver.execute_script("arguments[0].scrollIntoView(true);", load_more_button)
-      time.sleep(0.5) # Breve pausa dopo lo scroll
-
-      # Ottieni il numero di prodotti PRIMA di cliccare
-      initial_product_count = len(driver.find_elements(By.CSS_SELECTOR, PRODUCT_CONTAINER_SELECTOR))
-      print(f"Trovati {initial_product_count} prodotti prima di cliccare.")
-
-      # Clicca sul pulsante
-      # Prova prima il click diretto, se fallisce usa execute_script
-      try:
-        load_more_button.click()
-        print("Cliccato su 'Visualizza di più' (click diretto).")
-      except ElementClickInterceptedException:
-        print("Click diretto intercettato. Tentativo con execute_script.")
-        driver.execute_script("arguments[0].click();", load_more_button)
-        print("Cliccato su 'Visualizza di più' (execute_script).")
-
-      # Attendi che il numero di prodotti AUMENTI DOPO il click
-      # Questa è una strategia di attesa più robusta di un sleep fisso
-      try:
-        print("Attendere il caricamento di nuovi prodotti...")
-        wait.until(
-          lambda driver: len(driver.find_elements(By.CSS_SELECTOR, PRODUCT_CONTAINER_SELECTOR)) > initial_product_count
+class SikaScraper:
+    def __init__(self, output_folder="sika_products"):
+        """Inizializza lo scraper con le configurazioni necessarie."""
+        self.base_url = "https://ita.sika.com"
+        self.start_url = "https://ita.sika.com/it/edilizia/prodotti-edilizia.html"
+        self.output_folder = output_folder
+        self.images_folder = os.path.join(output_folder, "images")
+        self.products_data = []
+        
+        # Crea cartelle di output se non esistono
+        os.makedirs(self.output_folder, exist_ok=True)
+        os.makedirs(self.images_folder, exist_ok=True)
+        
+        # Configura Selenium
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")  # Esegui in modalità headless (senza GUI)
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        
+        # Inizializza il webdriver
+        self.driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=chrome_options
         )
-        print(f"Nuovi prodotti caricati. Totale attuale: {len(driver.find_elements(By.CSS_SELECTOR, PRODUCT_CONTAINER_SELECTOR))}")
-      except TimeoutException:
-        print("Timeout nell'attesa di nuovi prodotti. Potrebbero non essercene altri o il caricamento è molto lento.")
-        break # Esci dal ciclo se non appaiono nuovi prodotti
-
-
-    except (NoSuchElementException, TimeoutException, StaleElementReferenceException):
-      # Il pulsante non è più presente, non è cliccabile, o c'è un errore di riferimento obsoleto
-      print("Pulsante 'Visualizza di più' non più presente o non cliccabile. Tutti i prodotti dovrebbero essere caricati.")
-      break # Esci dal ciclo while True
-
-  # Ora che tutti i prodotti sono caricati (o non ci sono più pulsanti), ottieni l'HTML
-  print("Ottenere l'HTML finale della pagina...")
-  page_source = driver.page_source
-
-  # Chiudi il browser Selenium
-  driver.quit()
-  print("Browser chiuso.")
-
-  # Usa BeautifulSoup per analizzare l'HTML
-  soup = BeautifulSoup(page_source, 'html.parser')
-
-  all_products_data = []
-
-  # Trova tutti i contenitori dei prodotti utilizzando il selettore corretto
-  product_containers = soup.select(PRODUCT_CONTAINER_SELECTOR)
-  print(f"Trovati {len(product_containers)} contenitori prodotto ('{PRODUCT_CONTAINER_SELECTOR}') nell'HTML finale per l'estrazione dati.")
-
-  if not product_containers:
-    print("Nessun contenitore prodotto trovato nell'HTML finale. Controlla il selettore.")
-    return []
-
-  for i, container in enumerate(product_containers):
-    # print(f"Elaborazione prodotto {i+1}/{len(product_containers)}...") # Messo a commento per ridurre output
-    try:
-      product_data = {
-        "name": "N/A",
-        "brand": "Sika", # Marca fissa per questo sito
-        "description": "N/A",
-        "price": "N/A", # Non sembra esserci un prezzo visibile
-        "image_url": "N/A",
-        "product_page_url": "N/A"
-      }
-
-      # Estrai il link e l'URL della pagina di dettaglio
-      link_tag = container.select_one(PRODUCT_LINK_SELECTOR)
-      if link_tag and link_tag.has_attr('href'):
-        relative_url = link_tag['href']
-        # Assicurati che l'URL sia assoluto se necessario (Sika sembra usare percorsi relativi che partono dalla root)
-        if relative_url.startswith('/'):
-          # Costruisci l'URL completo basato sulla struttura del sito Sika
-          product_data["product_page_url"] = "https://ita.sika.com" + relative_url
-        else:
-          product_data["product_page_url"] = relative_url # Già assoluto o altro formato inatteso
-
-      # Estrai il Nome del prodotto
-      name_tag = container.select_one(PRODUCT_TITLE_SELECTOR)
-      if name_tag:
-        product_data["name"] = name_tag.get_text(strip=True)
-
-      # Estrai la Descrizione del prodotto
-      description_tag = container.select_one(PRODUCT_DESCRIPTION_SELECTOR)
-      if description_tag:
-        product_data["description"] = description_tag.get_text(strip=True)
-
-      # Estrai l'URL dell'immagine
-      # Cerca il tag img all'interno del selettore più specifico
-      img_tag = container.select_one(PRODUCT_IMAGE_SELECTOR)
-      if img_tag and img_tag.has_attr('src'):
-        image_src = img_tag['src']
-        # Costruisci l'URL completo dell'immagine se è relativo
-        if image_src.startswith('//'):
-          product_data["image_url"] = "https:" + image_src
-        elif image_src.startswith('/'):
-          # Assumi che le immagini relative partano dalla root del sito Sika
-          product_data["image_url"] = "https://ita.sika.com" + image_src
-        elif not image_src.startswith('http'):
-          # Gestisci altri casi di URL relativo se necessario
-          product_data["image_url"] = "https://ita.sika.com/" + image_src.lstrip("/")
-        else:
-          product_data["image_url"] = image_src # Già URL assoluto
-
-
-      # Aggiungi i dati estratti alla lista principale
-      all_products_data.append(product_data)
-
-    except Exception as e:
-      print(f"Errore durante l'elaborazione del contenitore prodotto {i+1}: {e}")
-      continue # Continua con il prossimo prodotto anche in caso di errore su uno
-
-  return all_products_data
-
-
-def save_to_csv(data, filename):
-  """Salva una lista di dizionari in un file CSV."""
-  if not data:
-    print("Nessun dato da salvare nel file CSV.")
-    return
-
-  script_dir = os.path.dirname(os.path.abspath(__file__))
-  csv_file_path = os.path.join(script_dir, filename)
-
-  try:
-    # Ottieni le chiavi dal primo dizionario per le intestazioni
-    keys = data[0].keys()
-    with open(csv_file_path, 'w', newline='', encoding='utf-8') as output_file:
-      dict_writer = csv.DictWriter(output_file, fieldnames=keys)
-      dict_writer.writeheader() # Scrive l'intestazione (nomi colonne)
-      dict_writer.writerows(data) # Scrive i dati
-    print(f"Dati salvati in {csv_file_path}")
-  except IndexError:
-    print("Nessun dato prodotto valido estratto per determinare le intestazioni CSV.")
-  except Exception as e:
-    print(f"Errore durante il salvataggio del file CSV: {e}")
+        self.driver.implicitly_wait(10)
+    
+    def load_all_products(self):
+        """Carica tutti i prodotti cliccando sul pulsante 'Più Risultati' finché è presente."""
+        print("Caricamento della pagina principale...")
+        self.driver.get(self.start_url)
+        time.sleep(3)  # Attendi caricamento iniziale
+        
+        # Accetta i cookie se presente il banner
+        try:
+            cookie_button = WebDriverWait(self.driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "button.onetrust-accept-btn-handler"))
+            )
+            cookie_button.click()
+            print("Banner cookie accettato")
+            time.sleep(1)
+        except TimeoutException:
+            print("Nessun banner cookie trovato o già accettato")
+        
+        # Clicca sul pulsante "Più Risultati" finché esiste
+        load_more_count = 0
+        while True:
+            try:
+                load_more_button = WebDriverWait(self.driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "div.load-more-results button.cmp-button"))
+                )
+                self.driver.execute_script("arguments[0].scrollIntoView(true);", load_more_button)
+                time.sleep(1)
+                load_more_button.click()
+                load_more_count += 1
+                print(f"Cliccato 'Più Risultati' ({load_more_count} volte)")
+                time.sleep(2)  # Attendi caricamento nuovi prodotti
+            except (TimeoutException, NoSuchElementException):
+                print("Nessun altro pulsante 'Più Risultati' trovato. Tutti i prodotti sono stati caricati.")
+                break
+        
+        print(f"Completato il caricamento di tutti i prodotti (pulsante 'Più Risultati' cliccato {load_more_count} volte)")
+    
+    def get_product_links(self):
+        """Estrae i link di tutti i prodotti dalla pagina principale."""
+        print("Estraendo i link di tutti i prodotti...")
+        
+        # Trova tutti gli elementi dei prodotti
+        product_elements = self.driver.find_elements(By.CSS_SELECTOR, "div[data-list-item] div.cmp-teaser_product a")
+        
+        # Estrai gli URL
+        product_links = []
+        for element in product_elements:
+            href = element.get_attribute("href")
+            if href:
+                product_links.append(href)
+        
+        print(f"Trovati {len(product_links)} prodotti")
+        return product_links
+    
+    def extract_highest_quality_image_url(self, img_element):
+        """Estrae l'URL dell'immagine con la qualità più alta dal tag picture."""
+        try:
+            # Estrai il codice HTML completo dell'elemento picture
+            picture_html = img_element.get_attribute('outerHTML')
+            
+            # Trova tutti gli URL delle immagini usando regex
+            image_urls = re.findall(r'https://sika\.scene7\.com/is/image/[^?"\']+', picture_html)
+            
+            # Se non ci sono URL, prova a estrarre direttamente dall'attributo src dell'immagine
+            if not image_urls:
+                img_src = img_element.find_element(By.TAG_NAME, "img").get_attribute("src")
+                if img_src:
+                    image_urls = [img_src]
+            
+            # Seleziona la versione con la risoluzione più alta
+            # Le immagini di qualità superiore in genere hanno parametri come wid=1620 o wid=2440
+            highest_quality_url = None
+            highest_width = 0
+            
+            for url in image_urls:
+                # Aggiungi parametri per massima qualità se l'URL base è stato trovato
+                base_url = url.split('?')[0] if '?' in url else url
+                quality_url = f"{base_url}?wid=2440&fit=crop%2C1&fmt=png-alpha"
+                
+                # Registra l'URL di qualità più alta
+                current_width = 2440  # Impostiamo la larghezza massima
+                if current_width > highest_width:
+                    highest_width = current_width
+                    highest_quality_url = quality_url
+            
+            return highest_quality_url
+        
+        except Exception as e:
+            print(f"Errore nell'estrazione dell'URL dell'immagine: {e}")
+            return None
+    
+    def download_image(self, url, product_name):
+        """Scarica l'immagine e salva il file."""
+        if not url:
+            return None
+        
+        try:
+            # Crea un nome file sicuro per l'immagine
+            safe_filename = "".join([c if c.isalnum() or c in ['-', '_'] else '_' for c in product_name])
+            filename = f"{safe_filename}.png"
+            filepath = os.path.join(self.images_folder, filename)
+            
+            # Scarica l'immagine
+            response = requests.get(url, stream=True)
+            if response.status_code == 200:
+                with open(filepath, 'wb') as f:
+                    for chunk in response.iter_content(1024):
+                        f.write(chunk)
+                print(f"Immagine salvata: {filepath}")
+                return filename
+            else:
+                print(f"Errore nel download dell'immagine: HTTP {response.status_code}")
+                return None
+        
+        except Exception as e:
+            print(f"Errore nel download dell'immagine: {e}")
+            return None
+    
+    def scrape_product_details(self, url):
+        """Estrae i dettagli del prodotto dalla sua pagina."""
+        print(f"Elaborazione prodotto: {url}")
+        self.driver.get(url)
+        time.sleep(2)  # Attendi il caricamento della pagina
+        
+        try:
+            # Estrai il nome del prodotto
+            product_name_element = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div.cmp-product__title h1.cmp-title__text"))
+            )
+            product_name = product_name_element.text.strip()
+            
+            # Estrai la descrizione del prodotto
+            try:
+                product_desc_element = self.driver.find_element(By.CSS_SELECTOR, "p[itemprop='description']")
+                product_description = product_desc_element.text.strip()
+            except NoSuchElementException:
+                product_description = "Descrizione non disponibile"
+            
+            # Estrai l'URL dell'immagine di alta qualità
+            try:
+                picture_element = self.driver.find_element(By.CSS_SELECTOR, "picture")
+                image_url = self.extract_highest_quality_image_url(picture_element)
+                image_filename = self.download_image(image_url, product_name) if image_url else None
+            except NoSuchElementException:
+                image_url = None
+                image_filename = None
+            
+            # Crea il record del prodotto
+            product_data = {
+                "nome": product_name,
+                "descrizione": product_description,
+                "url": url,
+                "immagine_url": image_url,
+                "immagine_filename": image_filename
+            }
+            
+            print(f"Prodotto elaborato: {product_name}")
+            return product_data
+            
+        except Exception as e:
+            print(f"Errore nell'elaborazione del prodotto {url}: {e}")
+            return None
+    
+    def save_to_csv(self):
+        """Salva i dati dei prodotti in un file CSV."""
+        csv_file = os.path.join(self.output_folder, "sika_products.csv")
+        
+        with open(csv_file, 'w', newline='', encoding='utf-8') as file:
+            fieldnames = ["nome", "descrizione", "url", "immagine_url", "immagine_filename"]
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for product in self.products_data:
+                if product:  # Skip None values
+                    writer.writerow(product)
+        
+        print(f"Dati salvati in {csv_file}")
+    
+    def run(self):
+        """Esegui lo scraping completo."""
+        try:
+            print("Avvio dello scraping...")
+            
+            # Carica tutti i prodotti
+            self.load_all_products()
+            
+            # Ottieni i link ai prodotti
+            product_links = self.get_product_links()
+            
+            # Estrai i dettagli per ogni prodotto
+            for i, link in enumerate(product_links, 1):
+                print(f"Elaborazione prodotto {i}/{len(product_links)}")
+                product_data = self.scrape_product_details(link)
+                if product_data:
+                    self.products_data.append(product_data)
+                
+                # Pausa breve per evitare di sovraccaricare il server
+                time.sleep(1)
+            
+            # Salva i dati in CSV
+            self.save_to_csv()
+            
+            print(f"Scraping completato! Elaborati {len(self.products_data)} prodotti.")
+            
+        except Exception as e:
+            print(f"Errore durante lo scraping: {e}")
+        
+        finally:
+            # Chiudi il browser
+            self.driver.quit()
 
 
 if __name__ == "__main__":
-  # Esegui lo scraping della pagina Sika
-  sika_products = scrape_sika_products(SIKA_URL)
-
-  # Salva i dati estratti in un file CSV
-  save_to_csv(sika_products, OUTPUT_CSV_FILE)
+    scraper = SikaScraper()
+    scraper.run()

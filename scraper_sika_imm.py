@@ -99,6 +99,139 @@ def get_product_urls_from_listing(driver, url):
     return product_urls
 
 
+def get_highest_quality_image(soup, product_url):
+    """
+    Funzione dedicata per estrarre l'immagine di qualità più elevata da diverse fonti
+    nella pagina del prodotto, controllando anche dimensioni e risoluzioni specificate.
+    """
+    img_url = "N/A"
+    product_picture_tag = soup.select_one(PRODUCT_PICTURE_SELECTOR_DETAIL)
+    
+    if not product_picture_tag:
+        print("  Nessun tag <picture> trovato per il prodotto.")
+        return img_url
+        
+    print("  Trovato tag <picture> usando il selettore specifico del prodotto.")
+    
+    # 1. Prima cerchiamo immagini di alta qualità da fonti specifiche
+    picture_sources = {}
+    
+    # Controlliamo prima qualsiasi tag <img> con attributo data-high-resolution-src
+    highres_img = product_picture_tag.select_one("img[data-high-resolution-src]")
+    if highres_img and highres_img.has_attr('data-high-resolution-src'):
+        url = highres_img['data-high-resolution-src']
+        if url and not url.startswith('data:'):
+            print(f"  Trovata immagine ad alta risoluzione con data-high-resolution-src: {url[:100]}...")
+            img_url = url
+            return normalize_image_url(img_url, SIKA_BASE_URL)
+    
+    # 2. Controlliamo per tag <img> all'interno di <picture>
+    img_tag = product_picture_tag.select_one("img")
+    if img_tag:
+        # Cercare attributi per immagini ad alta qualità
+        potential_attrs = ['src', 'data-src', 'data-srcset', 'data-original', 'data-original-set']
+        
+        for attr in potential_attrs:
+            if img_tag.has_attr(attr):
+                value = img_tag[attr]
+                if value and not value.startswith('data:'):
+                    print(f"  Trovato attributo {attr} nel tag <img>: {value[:100]}...")
+                    picture_sources[attr] = value
+    
+    # 3. Procediamo con l'analisi dei tag <source> nel <picture> per srcset
+    source_tags = product_picture_tag.select("source")
+    best_url_from_srcset = None
+    max_width = 0
+    max_density = 0
+    
+    print(f"  Trovati {len(source_tags)} tag <source> nella picture del prodotto.")
+    for source_tag in source_tags:
+        srcset_value = source_tag.get('srcset')
+        if not srcset_value:
+            continue
+            
+        print(f"    Analisi srcset in <source>: {srcset_value[:100]}...")
+        sources = srcset_value.split(',')
+        
+        for source in sources:
+            parts = source.strip().split()
+            if len(parts) < 1:
+                continue
+                
+            url = parts[0]
+            
+            # Gestione dimensioni (width) o densità (2x, 3x)
+            width = 0
+            density = 0
+            
+            if len(parts) > 1:
+                dimension = parts[1]
+                
+                # Controlla se è una dimensione (width) o una densità (x)
+                if 'w' in dimension:
+                    try:
+                        width = int(dimension.replace('w', ''))
+                        print(f"      Trovata larghezza: {width}px per URL: {url[:50]}...")
+                    except ValueError:
+                        print(f"      Impossibile convertire la larghezza '{dimension}' in intero.")
+                elif 'x' in dimension:
+                    try:
+                        density = float(dimension.replace('x', ''))
+                        print(f"      Trovata densità: {density}x per URL: {url[:50]}...")
+                    except ValueError:
+                        print(f"      Impossibile convertire la densità '{dimension}' in float.")
+            
+            # Priorità alla densità più alta (retina), quindi alla larghezza più grande
+            if density > max_density:
+                max_density = density
+                best_url_from_srcset = url
+                print(f"      Nuovo miglior URL da srcset per densità {density}x: {url[:50]}...")
+            elif density == max_density and width > max_width:
+                max_width = width
+                best_url_from_srcset = url
+                print(f"      Nuovo miglior URL da srcset per larghezza {width}px: {url[:50]}...")
+            elif max_density == 0 and width > max_width:
+                max_width = width
+                best_url_from_srcset = url
+                print(f"      Nuovo miglior URL da srcset per larghezza {width}px: {url[:50]}...")
+    
+    # 4. Selezionare l'immagine migliore in base alle priorità:
+    # Priorità 1: Immagini ad alta risoluzione esplicite
+    if best_url_from_srcset:
+        img_url = best_url_from_srcset
+        print(f"  URL immagine selezionato da srcset: {img_url[:100]}...")
+    # Priorità 2: Qualsiasi URL trovato nei tag <img>
+    elif picture_sources:
+        # Preferire nella sequenza: data-src (lazy loading) -> src -> altri attributi
+        if 'data-src' in picture_sources:
+            img_url = picture_sources['data-src']
+        elif 'src' in picture_sources:
+            img_url = picture_sources['src']
+        else:
+            # Prendi il primo disponibile se non ci sono src/data-src
+            img_url = next(iter(picture_sources.values()))
+        print(f"  URL immagine selezionato dagli attributi <img>: {img_url[:100]}...")
+    
+    # Normalizzazione URL finale
+    return normalize_image_url(img_url, SIKA_BASE_URL)
+
+
+def normalize_image_url(img_url, base_url):
+    """
+    Normalizza l'URL dell'immagine, assicurandosi che sia completo.
+    """
+    if img_url == "N/A":
+        return img_url
+        
+    if img_url.startswith('//'):
+        img_url = "https:" + img_url
+    elif img_url.startswith('/'):
+        img_url = base_url + img_url
+    
+    print(f"  URL immagine finale normalizzato: {img_url}")
+    return img_url
+
+
 def scrape_product_detail(driver, product_url):
     print(f"Scraping pagina di dettaglio: {product_url}")
     product_data = {
@@ -129,68 +262,8 @@ def scrape_product_detail(driver, product_url):
             product_data["description"] = description_tag.get_text(strip=True)
             print(f"  Trovata Descrizione (snippet): {product_data['description'][:70]}...")
 
-        img_url = "N/A"
-        product_picture_tag = soup.select_one(PRODUCT_PICTURE_SELECTOR_DETAIL)
-
-        if product_picture_tag:
-            print("  Trovato tag <picture> usando il selettore specifico del prodotto.")
-            img_tag = product_picture_tag.select_one("img")
-            if img_tag and img_tag.has_attr('src'):
-                src_url = img_tag['src']
-                if src_url and not src_url.startswith('data:'):
-                    img_url = src_url
-                    print(f"  Trovato URL immagine da <img> src (non placeholder): {img_url[:100]}...")
-                else:
-                    print("  <img> src trovato ma è un placeholder data: URL.")
-            else:
-                print("  Tag <img> dentro <picture> del prodotto non trovato o senza src.")
-
-            if img_url == "N/A":
-                print("  img src non valido, ricerca in srcset dei tag <source>.")
-                best_url_from_srcset = None
-                max_width = 0
-
-                source_tags = product_picture_tag.select("source")
-                print(f"  Trovati {len(source_tags)} tag <source> nella picture del prodotto.")
-                for source_tag in source_tags:
-                    srcset_value = source_tag.get('srcset')
-                    if srcset_value:
-                        print(f"    Trovato srcset in <source>: {srcset_value[:100]}...")
-                        sources = srcset_value.split(',')
-                        for source in sources:
-                            parts = source.strip().split()
-                            if len(parts) >= 1:
-                                url = parts[0]
-                                width = 0
-                                if len(parts) > 1:
-                                    width_str = parts[1].replace('w', '')
-                                    try:
-                                        width = int(width_str)
-                                    except ValueError:
-                                        print(f"      Attenzione: Impossibile convertire la larghezza '{width_str}' in intero per {product_url}.")
-
-                                if width > max_width:
-                                    max_width = width
-                                    best_url_from_srcset = url
-                                    print(f"      Nuovo miglior URL da srcset (width={width}): {best_url_from_srcset[:100]}...")
-
-                    else:
-                        print("    Tag <source> senza attributo srcset.")
-
-                if best_url_from_srcset:
-                    img_url = best_url_from_srcset
-                    print(f"  URL immagine selezionato da srcset: {img_url[:100]}...")
-
-            if img_url != "N/A":
-                if img_url.startswith('//'):
-                    img_url = "https:" + img_url
-                elif img_url.startswith('/'):
-                    img_url = SIKA_BASE_URL + img_url
-                print(f"  URL immagine finale costruito: {img_url}")
-            else:
-                print("  Nessun URL immagine valido trovato in <picture>.")
-
-            product_data["image_url"] = img_url
+        # Utilizzo della nuova funzione per ottenere l'immagine della massima qualità
+        product_data["image_url"] = get_highest_quality_image(soup, product_url)
 
     except (TimeoutException, NoSuchElementException) as e:
         print(f"Errore Selenium (Timeout o Elemento non trovato) durante lo scraping della pagina di dettaglio {product_url}: {e}")
@@ -231,7 +304,7 @@ if __name__ == "__main__":
 
     all_product_urls = get_product_urls_from_listing(driver, SIKA_LISTING_URL)
 
-    urls_to_process = all_product_urls[:5]
+    urls_to_process = all_product_urls
 
     all_products_data = []
     print(f"\nInizio scraping delle {len(urls_to_process)} pagine di dettaglio prodotto (limitate per test) usando Selenium...")
