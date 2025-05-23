@@ -11,10 +11,10 @@ from urllib.parse import urljoin
 
 # Impostazioni iniziali
 # Il singolo URL di partenza per la lista di prodotti.
-START_URL = "https://www.edilportale.com/aziende/saint-gobain-weber_1892/prodotti"
+START_URL = "https://www.edilportale.com/aziende/ursa_3982/prodotti"
 
 # Nome del file CSV di output
-OUTPUT_CSV_FILE = "edilportale_prodotti_weber.csv"
+OUTPUT_CSV_FILE = "edilportale_prodotti_ursa.csv"
 
 # URL base del sito per costruire URL completi
 BASE_URL = "https://www.edilportale.com"
